@@ -1,37 +1,16 @@
-// Layout of Contract:
-// version
-// imports
-// errors
-// interfaces, libraries, contracts
-// Type declarations
-// State variables
-// Events
-// Modifiers
-// Functions
-
-// Layout of Functions:
-// constructor
-// receive function (if exists)
-// fallback function (if exists)
-// external
-// public
-// internal
-// private
-// internal & private view & pure functions
-// external & public view & pure functions
-
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.18;
 
 import {VRFConsumerBaseV2} from "@chainlink/contracts/src/v0.8/VRFConsumerBaseV2.sol";
 import {VRFCoordinatorV2Interface} from "@chainlink/contracts/src/v0.8/interfaces/VRFCoordinatorV2Interface.sol";
 import {AutomationCompatible} from "@chainlink/contracts/src/v0.8/AutomationCompatible.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {console} from "forge-std/console.sol";
 
 contract Lottery is VRFConsumerBaseV2, AutomationCompatible {
     //** Errors */
     error Lottery__MustBetween1And99();
-    error Lottery__NotEnoughEthSent();
+    error Lottery__NotEnoughTokensSent();
     error Lottery__TransferFailed();
     error Lottery__OnlyOwner();
     error Lottery__NotOpen();
@@ -64,6 +43,8 @@ contract Lottery is VRFConsumerBaseV2, AutomationCompatible {
     uint256 private s_lastTimeStamp;
     bool private s_hasPlayers;
 
+    IERC20 public rxctoken;
+
     mapping(uint256 => mapping(uint256 => address[])) private s_roundToSelectedNumToAddresses;
     mapping(uint256 => address[]) private s_roundToAllPlayers;
     mapping(uint256 => mapping(address => uint256[])) private s_roundToAddressToSelectedNumbers;
@@ -90,7 +71,8 @@ contract Lottery is VRFConsumerBaseV2, AutomationCompatible {
         address vrfCoordinator,
         bytes32 gasLane,
         uint64 subscriptionId,
-        uint32 callbackGasLimit
+        uint32 callbackGasLimit,
+        address rxctokenAddress  // Dodaj ovo kao novi parametar
     ) VRFConsumerBaseV2(vrfCoordinator) {
         i_costOfATicket = costOfATicket;
         i_commisionRate = commisionRate;
@@ -105,25 +87,31 @@ contract Lottery is VRFConsumerBaseV2, AutomationCompatible {
         s_roundCount = 1;
         s_lotteryState = LotteryState.OPEN;
         s_lastTimeStamp = block.timestamp;
+
+        rxctoken = IERC20(rxctokenAddress);  // Inicijalizacija RXCG tokena
     }
 
-    function buyTicket(uint256 number) public payable {
+    function buyTicket(uint256 number) public {
         if (s_lotteryState != LotteryState.OPEN) {
             revert Lottery__NotOpen();
         }
         if (number < 1 || number > 99) {
             revert Lottery__MustBetween1And99();
         }
-        if (msg.value < i_costOfATicket) {
-            revert Lottery__NotEnoughEthSent();
+        if (rxctoken.balanceOf(msg.sender) < i_costOfATicket) {
+            revert Lottery__NotEnoughTokensSent();
         }
         s_hasPlayers = true;
         s_roundToSelectedNumToAddresses[s_roundCount][number].push(msg.sender);
         s_roundToAddressToSelectedNumbers[s_roundCount][msg.sender].push(number);
         s_roundToAllPlayers[s_roundCount].push(msg.sender);
-        uint256 commision = (msg.value * i_commisionRate) / 100;
+
+        uint256 commision = (i_costOfATicket * i_commisionRate) / 100;
         s_commissionBalance += commision;
-        s_poolBalance += (msg.value - commision);
+        s_poolBalance += (i_costOfATicket - commision);
+
+        require(rxctoken.transferFrom(msg.sender, address(this), i_costOfATicket), "Token transfer failed");
+
         emit PurchasedTicket(s_roundCount, msg.sender, number);
     }
 
@@ -133,36 +121,28 @@ contract Lottery is VRFConsumerBaseV2, AutomationCompatible {
         override
         returns (bool upkeepNeeded, bytes memory /* performData */ )
     {
-        // set the conditions
-        // 1. time has passed
-        // 2. state is open
-        // 3. has players
-        // 4. has balance
-
         bool timeHasPassed = (block.timestamp - s_lastTimeStamp) >= i_interval;
         bool isOpen = s_lotteryState == LotteryState.OPEN;
         bool hasBalance = s_poolBalance > 0;
 
-        // if upkeepNeeded == ture, performUpkeep will run
         upkeepNeeded = (timeHasPassed && isOpen && s_hasPlayers && hasBalance);
         return (upkeepNeeded, "0x0");
     }
 
     function performUpkeep(bytes calldata /* performData */ ) external override {
-        // revalidating
         (bool upkeepNeeded,) = checkUpkeep("");
         if (!upkeepNeeded) {
             revert Lottery__UpkeepNotNeeded((block.timestamp - s_lastTimeStamp), uint256(s_lotteryState), s_hasPlayers);
         }
-        // execute the logic
+
         s_lotteryState = LotteryState.CALCULATING;
 
-        uint256 requestId = i_vrfCoordinator.requestRandomWords( // an unique address on each chain -> constructor()
-            i_gasLane, // keyHash == gasLane: the max gas you want to spend, different from chain to chain -> constructor() -> bytes32
-            i_subscriptionId, // get from the subscription manager by funding with "LINK" -> constructor() -> uint64
-            REQUEST_CONFIRMATIONS, // how many confirmed blocks are good for you? -> constant -> uint16 -> 3
-            i_callbackGasLimit, // the mas gas you want to spend for the "callback" function, different from chain to chain -> constructor() -> uint32
-            NUM_WORDS // number of random numbers we need? -> constant -> uint32 -> 1
+        uint256 requestId = i_vrfCoordinator.requestRandomWords(
+            i_gasLane,
+            i_subscriptionId,
+            REQUEST_CONFIRMATIONS,
+            i_callbackGasLimit,
+            NUM_WORDS
         );
         emit RequestedRandomWords(requestId);
     }
@@ -182,11 +162,7 @@ contract Lottery is VRFConsumerBaseV2, AutomationCompatible {
 
             for (uint256 i = 0; i < numOfWinners; i++) {
                 address winner = winners[i];
-
-                (bool success,) = winner.call{value: prize}("");
-                if (!success) {
-                    revert Lottery__TransferFailed();
-                }
+                require(rxctoken.transfer(winner, prize), "Token transfer to winner failed");
             }
             s_poolBalance = 0;
 
@@ -202,10 +178,7 @@ contract Lottery is VRFConsumerBaseV2, AutomationCompatible {
         if (s_commissionBalance <= 0) {
             revert Lottery__NoCommision();
         }
-        (bool success,) = i_owner.call{value: s_commissionBalance}("");
-        if (!success) {
-            revert Lottery__TransferFailed();
-        }
+        require(rxctoken.transfer(i_owner, s_commissionBalance), "Token transfer failed");
         s_commissionBalance = 0;
     }
 
